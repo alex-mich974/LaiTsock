@@ -1,0 +1,267 @@
+{
+  "name": "laitsock-frontend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "dexie": "^4.0.8",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.45",
+    "tailwindcss": "^3.4.10",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.5"
+  }
+}
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+});
+export default {
+  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  theme: { extend: {} },
+  plugins: [],
+};
+export default {
+  plugins: { tailwindcss: {}, autoprefixer: {} },
+};
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Laï Tsock Ivato</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+import Dexie, { type Table } from "dexie";
+
+export interface SyncQueueItem {
+  id?: number;
+  entite: string; // "commande", "paiement", etc.
+  entiteId: string; // uuid généré côté client
+  action: "CREATE" | "UPDATE";
+  payload: unknown;
+  createdAtClient: string; // ISO
+  synced: boolean;
+}
+
+class LaitsockDB extends Dexie {
+  syncQueue!: Table<SyncQueueItem, number>;
+
+  constructor() {
+    super("laitsock_ivato");
+    this.version(1).stores({
+      syncQueue: "++id, entite, entiteId, synced",
+    });
+  }
+}
+
+export const db = new LaitsockDB();
+
+// Identifiant unique du poste, généré une fois et conservé.
+export function getPosteId(): string {
+  let id = localStorage.getItem("poste_id");
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem("poste_id", id);
+  }
+  return id;
+}
+import { db } from "./db.js";
+import { getPosteId } from "./db.js";
+
+const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
+
+export async function ajouterEvenementSync(
+  entite: string,
+  entiteId: string,
+  action: "CREATE" | "UPDATE",
+  payload: unknown
+) {
+  await db.syncQueue.add({
+    entite,
+    entiteId,
+    action,
+    payload,
+    createdAtClient: new Date().toISOString(),
+    synced: false,
+  });
+  // Tentative immédiate si en ligne ; sinon ça reste en file
+  // et sera rejoué au retour de connexion (voir tenterSync).
+  if (navigator.onLine) {
+    tenterSync();
+  }
+}
+
+export async function tenterSync() {
+  const enAttente = await db.syncQueue.where("synced").equals(0 as any).toArray();
+  for (const item of enAttente) {
+    try {
+      const res = await fetch(`${API_URL}/sync/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ posteId: getPosteId(), ...item }),
+      });
+      if (res.ok && item.id) {
+        await db.syncQueue.update(item.id, { synced: true });
+      }
+    } catch {
+      // Toujours hors ligne, on réessaiera plus tard.
+      break;
+    }
+  }
+}
+
+window.addEventListener("online", () => tenterSync());
+import { create } from "zustand";
+
+interface Utilisateur {
+  id: string;
+  nomComplet: string;
+  role: string;
+  permissions: string[];
+}
+
+interface AuthState {
+  token: string | null;
+  utilisateur: Utilisateur | null;
+  login: (token: string, utilisateur: Utilisateur) => void;
+  logout: () => void;
+}
+
+export const useAuthStore = create<AuthState>((set) => ({
+  token: localStorage.getItem("token"),
+  utilisateur: JSON.parse(localStorage.getItem("utilisateur") ?? "null"),
+  login: (token, utilisateur) => {
+    localStorage.setItem("token", token);
+    localStorage.setItem("utilisateur", JSON.stringify(utilisateur));
+    set({ token, utilisateur });
+  },
+  logout: () => {
+    localStorage.removeItem("token");
+    localStorage.removeItem("utilisateur");
+    set({ token: null, utilisateur: null });
+  },
+}));
+import { useState } from "react";
+import { useAuthStore } from "../store/authStore.js";
+
+const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
+
+export function Login() {
+  const [identifiant, setIdentifiant] = useState("");
+  const [motDePasse, setMotDePasse] = useState("");
+  const [erreur, setErreur] = useState<string | null>(null);
+  const login = useAuthStore((s) => s.login);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setErreur(null);
+    try {
+      const res = await fetch(`${API_URL}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifiant, motDePasse }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setErreur(data.erreur ?? "Erreur de connexion");
+        return;
+      }
+      const data = await res.json();
+      login(data.token, data.utilisateur);
+    } catch {
+      setErreur("Impossible de joindre le serveur (hors ligne ?)");
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-neutral-100">
+      <form
+        onSubmit={handleSubmit}
+        className="bg-white p-8 rounded-xl shadow-md w-80 space-y-4"
+      >
+        <h1 className="text-xl font-semibold text-center">Laï Tsock Ivato</h1>
+        <input
+          className="w-full border rounded px-3 py-2"
+          placeholder="Identifiant"
+          value={identifiant}
+          onChange={(e) => setIdentifiant(e.target.value)}
+        />
+        <input
+          className="w-full border rounded px-3 py-2"
+          type="password"
+          placeholder="Mot de passe"
+          value={motDePasse}
+          onChange={(e) => setMotDePasse(e.target.value)}
+        />
+        {erreur && <p className="text-red-600 text-sm">{erreur}</p>}
+        <button
+          type="submit"
+          className="w-full bg-emerald-600 text-white rounded py-2 font-medium"
+        >
+          Se connecter
+        </button>
+      </form>
+    </div>
+  );
+}
+import { useAuthStore } from "./store/authStore.js";
+import { Login } from "./pages/Login.js";
+
+export default function App() {
+  const utilisateur = useAuthStore((s) => s.utilisateur);
+  const logout = useAuthStore((s) => s.logout);
+
+  if (!utilisateur) return <Login />;
+
+  return (
+    <div className="min-h-screen bg-neutral-50 p-8">
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-semibold">Laï Tsock Ivato</h1>
+        <div className="flex items-center gap-4">
+          <span className="text-sm text-neutral-600">
+            {utilisateur.nomComplet} — {utilisateur.role}
+          </span>
+          <button onClick={logout} className="text-sm text-red-600">
+            Déconnexion
+          </button>
+        </div>
+      </div>
+      <p className="text-neutral-500">
+        Socle technique en place. Les écrans (salle, cuisine, caisse…)
+        arrivent aux étapes suivantes.
+      </p>
+    </div>
+  );
+}
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App.js";
+import "./index.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
