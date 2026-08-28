@@ -1,0 +1,318 @@
+backend/package.json
+{
+  "name": "laitsock-backend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",  
+    "@fastify/jwt": "^8.0.1",
+    "@fastify/websocket": "^10.0.1",
+    "@prisma/client": "^5.19.1",
+    "argon2": "^0.40.3",
+    "fastify": "^4.28.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "prisma": "^5.19.1",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "@types/node": "^22.5.5"
+  }
+}
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src"]
+}
+DATABASE_URL="postgresql://laitsock_user:changeme@localhost:5432/laitsock_ivato"
+JWT_SECRET="change_this_to_a_long_random_string"
+PORT=4000
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RoleName {
+  ADMINISTRATEUR
+  MANAGER
+  CAISSIER
+  SERVEUR
+  CUISINIER
+}
+
+model Role {
+  id          String       @id @default(uuid())
+  nom         RoleName     @unique
+  permissions Permission[]
+  utilisateurs Utilisateur[]
+  createdAt   DateTime     @default(now())
+}
+
+model Permission {
+  id     String @id @default(uuid())
+  code   String @unique // ex: "COMMANDE_CREER", "PRIX_MODIFIER", "RAPPORTS_VOIR"
+  label  String
+  roles  Role[]
+}
+
+model Utilisateur {
+  id            String    @id @default(uuid())
+  nomComplet    String
+  identifiant   String    @unique // login
+  motDePasseHash String
+  roleId        String
+  role          Role      @relation(fields: [roleId], references: [id])
+  actif         Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  auditLogs     AuditLog[]
+}
+
+model AuditLog {
+  id            String       @id @default(uuid())
+  utilisateurId String?
+  utilisateur   Utilisateur? @relation(fields: [utilisateurId], references: [id])
+  action        String       // ex: "LOGIN", "COMMANDE_CREEE", "PRIX_MODIFIE"
+  cible         String?      // ex: "commande:uuid"
+  avant         Json?
+  apres         Json?
+  createdAt     DateTime     @default(now())
+}
+
+// File d'attente de synchronisation offline-first.
+// Chaque poste client pousse ici les événements créés hors-ligne.
+model SyncEvent {
+  id            String   @id @default(uuid())
+  posteId       String   // identifiant du poste client (ex: uuid généré au premier lancement)
+  entite        String   // ex: "commande", "paiement", "mouvement_stock"
+  entiteId      String   // uuid généré côté client
+  action        String   // "CREATE" | "UPDATE"
+  payload       Json
+  createdAtClient DateTime // horodatage côté client, au moment de l'action réelle
+  receivedAt    DateTime @default(now())
+  traite        Boolean  @default(false)
+}
+import { PrismaClient } from "@prisma/client";
+import argon2 from "argon2";
+
+const prisma = new PrismaClient();
+
+const PERMISSIONS = [
+  { code: "COMMANDE_CREER", label: "Créer une commande" },
+  { code: "COMMANDE_MODIFIER", label: "Modifier une commande" },
+  { code: "PRIX_MODIFIER", label: "Modifier les prix" },
+  { code: "CAISSE_ENCAISSER", label: "Encaisser un paiement" },
+  { code: "CAISSE_CLOTURER", label: "Clôturer la caisse" },
+  { code: "STOCK_GERER", label: "Gérer les stocks" },
+  { code: "RAPPORTS_VOIR", label: "Voir les rapports financiers" },
+  { code: "PERSONNEL_GERER", label: "Gérer le personnel et les permissions" },
+  { code: "CUISINE_VOIR", label: "Voir l'écran cuisine" },
+];
+
+const ROLE_PERMISSIONS: Record<string, string[]> = {
+  ADMINISTRATEUR: PERMISSIONS.map((p) => p.code),
+  MANAGER: [
+    "COMMANDE_CREER", "COMMANDE_MODIFIER", "CAISSE_ENCAISSER",
+    "CAISSE_CLOTURER", "STOCK_GERER", "RAPPORTS_VOIR", "CUISINE_VOIR",
+  ],
+  CAISSIER: ["CAISSE_ENCAISSER", "CAISSE_CLOTURER"],
+  SERVEUR: ["COMMANDE_CREER", "COMMANDE_MODIFIER"],
+  CUISINIER: ["CUISINE_VOIR"],
+};
+
+async function main() {
+  for (const p of PERMISSIONS) {
+    await prisma.permission.upsert({
+      where: { code: p.code },
+      update: {},
+      create: p,
+    });
+  }
+
+  for (const [roleName, permCodes] of Object.entries(ROLE_PERMISSIONS)) {
+    await prisma.role.upsert({
+      where: { nom: roleName as any },
+      update: {
+        permissions: { set: permCodes.map((code) => ({ code })) },
+      },
+      create: {
+        nom: roleName as any,
+        permissions: { connect: permCodes.map((code) => ({ code })) },
+      },
+    });
+  }
+
+  const adminRole = await prisma.role.findUniqueOrThrow({
+    where: { nom: "ADMINISTRATEUR" },
+  });
+
+  const hash = await argon2.hash("admin123"); // à changer immédiatement en prod
+
+  await prisma.utilisateur.upsert({
+    where: { identifiant: "admin" },
+    update: {},
+    create: {
+      nomComplet: "Administrateur",
+      identifiant: "admin",
+      motDePasseHash: hash,
+      roleId: adminRole.id,
+    },
+  });
+
+  console.log("Seed terminé. Login: admin / admin123 (à changer !)");
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(() => prisma.$disconnect());
+"prisma": { "seed": "tsx prisma/seed.ts" }
+import { PrismaClient } from "@prisma/client";
+
+export const prisma = new PrismaClient();import { PrismaClient } from "@prisma/client";
+
+export const prisma = new PrismaClient();
+import { FastifyReply, FastifyRequest } from "fastify";
+
+export async function verifierAuth(req: FastifyRequest, reply: FastifyReply) {
+  try {
+    await req.jwtVerify();
+  } catch {
+    reply.code(401).send({ erreur: "Non authentifié" });
+  }
+}
+
+// Vérifie qu'un utilisateur possède une permission donnée.
+// La liste de permissions est incluse dans le JWT au moment du login.
+export function requiresPermission(code: string) {
+  return async (req: FastifyRequest, reply: FastifyReply) => {
+    const user = req.user as { permissions: string[] };
+    if (!user?.permissions?.includes(code)) {
+      reply.code(403).send({ erreur: `Permission manquante: ${code}` });
+    }
+  };
+}
+import { FastifyInstance } from "fastify";
+import argon2 from "argon2";
+import { z } from "zod";
+import { prisma } from "../lib/prisma.js";
+
+const loginSchema = z.object({
+  identifiant: z.string().min(1),
+  motDePasse: z.string().min(1),
+});
+
+export async function authRoutes(app: FastifyInstance) {
+  app.post("/auth/login", async (req, reply) => {
+    const body = loginSchema.parse(req.body);
+
+    const utilisateur = await prisma.utilisateur.findUnique({
+      where: { identifiant: body.identifiant },
+      include: { role: { include: { permissions: true } } },
+    });
+
+    if (!utilisateur || !utilisateur.actif) {
+      return reply.code(401).send({ erreur: "Identifiants invalides" });
+    }
+
+    const motDePasseValide = await argon2.verify(
+      utilisateur.motDePasseHash,
+      body.motDePasse
+    );
+
+    if (!motDePasseValide) {
+      return reply.code(401).send({ erreur: "Identifiants invalides" });
+    }
+
+    const permissions = utilisateur.role.permissions.map((p) => p.code);
+
+    const token = app.jwt.sign(
+      {
+        sub: utilisateur.id,
+        nomComplet: utilisateur.nomComplet,
+        role: utilisateur.role.nom,
+        permissions,
+      },
+      { expiresIn: "12h" }
+    );
+
+    await prisma.auditLog.create({
+      data: {
+        utilisateurId: utilisateur.id,
+        action: "LOGIN",
+      },
+    });
+
+    return {
+      token,
+      utilisateur: {
+        id: utilisateur.id,
+        nomComplet: utilisateur.nomComplet,
+        role: utilisateur.role.nom,
+        permissions,
+      },
+    };
+  });
+}
+import { FastifyInstance } from "fastify";
+import { prisma } from "../lib/prisma.js";
+
+export async function healthRoutes(app: FastifyInstance) {
+  app.get("/health", async () => {
+    await prisma.$queryRaw`SELECT 1`;
+    return { status: "ok", timestamp: new Date().toISOString() };
+  });
+}
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import jwt from "@fastify/jwt";
+import websocket from "@fastify/websocket";
+import { authRoutes } from "./routes/auth.js";
+import { healthRoutes } from "./routes/health.js";
+
+const app = Fastify({ logger: true });
+
+await app.register(cors, { origin: true });
+await app.register(jwt, { secret: process.env.JWT_SECRET! });
+await app.register(websocket);
+
+await app.register(healthRoutes);
+await app.register(authRoutes);
+
+// Placeholder websocket : sera utilisé aux étapes Cuisine/Salle
+// pour pousser les mises à jour en temps réel.
+app.register(async (app) => {
+  app.get("/ws", { websocket: true }, (connection) => {
+    connection.socket.on("message", (message) => {
+      connection.socket.send(`echo: ${message}`);
+    });
+  });
+});
+
+const port = Number(process.env.PORT) || 4000;
+app.listen({ port, host: "0.0.0.0" }).then(() => {
+  console.log(`Backend démarré sur http://localhost:${port}`);
+});
